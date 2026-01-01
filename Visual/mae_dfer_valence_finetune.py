@@ -39,10 +39,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
 
-from timm.models.layers import drop_path, to_2tuple, trunc_normal_
-from timm.models.registry import register_model
-from einops import rearrange
-
 # ---- 固定亂數種子 ----
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -162,376 +158,43 @@ print(f"{'='*60}\n")
 
 
 # ============================================
-# 3. MAE-DFER 模型定義 (LGI-Former)
+# 3. 下載 MAE-DFER 原始模型定義
 # ============================================
+import subprocess
+import sys
 
-class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample."""
-    def __init__(self, drop_prob=None):
-        super(DropPath, self).__init__()
-        self.drop_prob = drop_prob
+MODELING_FILE = "/content/modeling_finetune.py"
 
-    def forward(self, x):
-        return drop_path(x, self.drop_prob, self.training)
+print("\n📥 下載 MAE-DFER 原始模型定義...")
 
+# 下載原始 repo 的 modeling_finetune.py
+download_url = "https://raw.githubusercontent.com/sunlicai/MAE-DFER/master/modeling_finetune.py"
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class CrossAttention(nn.Module):
-    """Cross-attention for local-global interaction."""
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        self.q = nn.Linear(dim, dim, bias=False)
-        self.kv = nn.Linear(dim, dim * 2, bias=False)
-
-        if qkv_bias:
-            self.q_bias = nn.Parameter(torch.zeros(dim))
-            self.v_bias = nn.Parameter(torch.zeros(dim))
-        else:
-            self.q_bias = None
-            self.v_bias = None
-
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x, context=None):
-        B, T1, C = x.shape
-        context = context if context is not None else x
-        _, T2, _ = context.shape
-
-        q_bias = self.q_bias if self.q_bias is not None else torch.zeros(C, device=x.device)
-        q = F.linear(x, self.q.weight, q_bias)
-        q = q.reshape(B, T1, self.num_heads, -1).permute(0, 2, 1, 3)
-
-        kv_bias = torch.cat([torch.zeros(C, device=x.device), self.v_bias]) if self.v_bias is not None else None
-        kv = F.linear(context, self.kv.weight, kv_bias)
-        kv = kv.reshape(B, T2, 2, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, T1, -1)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class LocalGlobalBlock(nn.Module):
-    """
-    LGI-Former Block: Local-Global Interaction Transformer Block
-    
-    Three stages:
-    1. Local Intra-Region Self-Attention
-    2. Global Inter-Region Self-Attention
-    3. Local-Global Interaction (Cross-Attention)
-    """
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, 
-                 drop=0., attn_drop=0., drop_path=0., init_values=None, 
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 lg_region_size=(2, 7, 7), lg_third_attn_type='cross'):
-        super().__init__()
-        self.lg_region_size = lg_region_size
-        self.lg_third_attn_type = lg_third_attn_type
-
-        # Stage 1: Local intra-region self-attention
-        self.first_attn_norm0 = norm_layer(dim)
-        self.first_attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, 
-                                    qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-
-        # Stage 2: Global inter-region self-attention
-        self.second_attn_norm0 = norm_layer(dim)
-        self.second_attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
-                                     qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-
-        # Stage 3: Local-global interaction
-        self.third_attn_norm0 = norm_layer(dim)
-        self.third_attn_norm1 = norm_layer(dim)
-        self.third_attn = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
-                                         qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-
-        # FFN
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-        self.messenger_norm2 = norm_layer(dim)
-        self.messenger_mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-        if init_values is not None and init_values > 0:
-            self.gamma_1 = nn.Parameter(init_values * torch.ones(dim), requires_grad=True)
-            self.gamma_2 = nn.Parameter(init_values * torch.ones(dim), requires_grad=True)
-        else:
-            self.gamma_1, self.gamma_2 = None, None
-
-    def forward(self, x, messenger_tokens, input_token_size):
-        t, h, w = input_token_size
-        rt, rh, rw = self.lg_region_size
-        b = x.shape[0]
-        nt, nh, nw = t // rt, h // rh, w // rw
-        n_regions = nt * nh * nw
-
-        # Reshape to regions
-        x = rearrange(x, 'b (nt rt nh rh nw rw) c -> (b nt nh nw) (rt rh rw) c',
-                      nt=nt, rt=rt, nh=nh, rh=rh, nw=nw, rw=rw)
-        messenger_tokens = rearrange(messenger_tokens, 'b (nt nh nw) c -> (b nt nh nw) 1 c',
-                                     nt=nt, nh=nh, nw=nw)
-
-        x = torch.cat([messenger_tokens, x], dim=1)
-
-        # Stage 1: Local attention
-        if self.gamma_1 is None:
-            x = x + self.drop_path(self.first_attn(self.first_attn_norm0(x)))
-        else:
-            x = x + self.drop_path(self.gamma_1 * self.first_attn(self.first_attn_norm0(x)))
-
-        # Stage 2: Global attention on messenger tokens
-        messenger_tokens = rearrange(x[:, 0].clone(), '(b n) c -> b n c', b=b)
-        messenger_tokens = messenger_tokens + self.drop_path(
-            self.second_attn(self.second_attn_norm0(messenger_tokens))
-        )
-        x = torch.cat([rearrange(messenger_tokens, 'b n c -> (b n) 1 c'), x[:, 1:]], dim=1)
-
-        # Stage 3: Cross-attention
-        messenger_tokens = rearrange(x[:, 0].clone(), '(b n) c -> b n c', b=b)
-        local_tokens = rearrange(x[:, 1:].clone(), '(b n) s c -> b (n s) c', b=b)
-
-        local_tokens = local_tokens + self.drop_path(
-            self.third_attn(self.third_attn_norm0(local_tokens), self.third_attn_norm1(messenger_tokens))
-        )
-
-        # FFN
-        if self.gamma_2 is None:
-            local_tokens = local_tokens + self.drop_path(self.mlp(self.norm2(local_tokens)))
-        else:
-            local_tokens = local_tokens + self.drop_path(self.gamma_2 * self.mlp(self.norm2(local_tokens)))
-
-        messenger_tokens = messenger_tokens + self.drop_path(
-            self.messenger_mlp(self.messenger_norm2(messenger_tokens))
-        )
-
-        # Reshape back
-        x = rearrange(local_tokens, 'b (nt rt nh rh nw rw) c -> b (nt nh nw rt rh rw) c',
-                      nt=nt, rt=rt, nh=nh, rh=rh, nw=nw, rw=rw)
-        x = rearrange(x, 'b (n s) c -> b n s c', n=n_regions)
-        x = rearrange(x, 'b n s c -> b (n s) c')
-        x = rearrange(x, 'b (nt nh nw rt rh rw) c -> b (nt rt nh rh nw rw) c',
-                      nt=nt, rt=rt, nh=nh, rh=rh, nw=nw, rw=rw)
-
-        return x, messenger_tokens
-
-
-class PatchEmbed(nn.Module):
-    """Video to Patch Embedding with 3D Conv."""
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, 
-                 num_frames=16, tubelet_size=2):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.tubelet_size = tubelet_size
-
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0]) * (num_frames // tubelet_size)
-        self.num_patches = num_patches
-        self.input_token_size = (num_frames // tubelet_size, img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-
-        self.proj = nn.Conv3d(
-            in_channels=in_chans, out_channels=embed_dim,
-            kernel_size=(tubelet_size, patch_size[0], patch_size[1]),
-            stride=(tubelet_size, patch_size[0], patch_size[1])
-        )
-
-    def forward(self, x):
-        x = self.proj(x).flatten(2).transpose(1, 2)
-        return x
-
-
-def get_sinusoid_encoding_table(n_position, d_hid):
-    def get_position_angle_vec(position):
-        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
-    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])
-    return torch.FloatTensor(sinusoid_table).unsqueeze(0)
-
-
-class VisionTransformer(nn.Module):
-    """Vision Transformer with Local-Global Interaction (LGI-Former)."""
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, 
-                 embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=False, 
-                 qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0., 
-                 norm_layer=nn.LayerNorm, init_values=0., use_learnable_pos_emb=False,
-                 all_frames=16, tubelet_size=2, use_mean_pooling=True,
-                 attn_type='local_global', lg_region_size=(2, 7, 7)):
-        super().__init__()
-        self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim
-        self.attn_type = attn_type
-        self.lg_region_size = lg_region_size
-
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, 
-            embed_dim=embed_dim, num_frames=all_frames, tubelet_size=tubelet_size
-        )
-        num_patches = self.patch_embed.num_patches
-        self.input_token_size = self.patch_embed.input_token_size
-
-        if use_learnable_pos_emb:
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        else:
-            self.pos_embed = get_sinusoid_encoding_table(num_patches, embed_dim)
-
-        self.pos_drop = nn.Dropout(p=drop_rate)
-
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
-        if attn_type == 'local_global':
-            t, h, w = self.input_token_size
-            rt, rh, rw = lg_region_size
-            self.num_messenger_tokens = (t // rt) * (h // rh) * (w // rw)
-            self.messenger_tokens = nn.Parameter(torch.zeros(1, self.num_messenger_tokens, embed_dim))
-            trunc_normal_(self.messenger_tokens, std=.02)
-
-            self.blocks = nn.ModuleList([
-                LocalGlobalBlock(
-                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, 
-                    qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, 
-                    attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                    init_values=init_values, lg_region_size=lg_region_size
-                )
-                for i in range(depth)
-            ])
-        else:
-            from timm.models.vision_transformer import Block
-            self.blocks = nn.ModuleList([
-                Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, 
-                      qkv_bias=qkv_bias, drop=drop_rate, attn_drop=attn_drop_rate, 
-                      drop_path=dpr[i], norm_layer=norm_layer)
-                for i in range(depth)
-            ])
-
-        self.norm = norm_layer(embed_dim)
-        self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
-        self.use_mean_pooling = use_mean_pooling
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-
-        if use_learnable_pos_emb:
-            trunc_normal_(self.pos_embed, std=.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def get_num_layers(self):
-        return len(self.blocks)
-
-    def forward_features(self, x):
-        B = x.shape[0]
-        x = self.patch_embed(x)
-
-        if isinstance(self.pos_embed, nn.Parameter):
-            x = x + self.pos_embed
-        else:
-            x = x + self.pos_embed.to(x.device).type_as(x)
-
-        x = self.pos_drop(x)
-
-        if self.attn_type == 'local_global':
-            messenger_tokens = self.messenger_tokens.expand(B, -1, -1)
-            for blk in self.blocks:
-                x, messenger_tokens = blk(x, messenger_tokens, self.input_token_size)
-            x = messenger_tokens
-            x = self.norm(x)
-            if self.fc_norm is not None:
-                return self.fc_norm(x.mean(1))
-            else:
-                return x[:, 0]
-        else:
-            for blk in self.blocks:
-                x = blk(x)
-            x = self.norm(x)
-            if self.fc_norm is not None:
-                return self.fc_norm(x.mean(1))
-            else:
-                return x[:, 0]
-
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
-        return x
-
-
-@register_model
-def vit_base_dim512_local_global_attn_depth16_region_size2510_patch16_160(pretrained=False, **kwargs):
-    """MAE-DFER Base Model"""
-    model = VisionTransformer(
-        img_size=160, patch_size=16, embed_dim=512, depth=16, num_heads=8,
-        mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        attn_type='local_global', lg_region_size=(2, 5, 10), **kwargs
+try:
+    # 使用 wget 下載
+    result = subprocess.run(
+        ["wget", "-q", "-O", MODELING_FILE, download_url],
+        capture_output=True, text=True
     )
-    return model
+    if result.returncode != 0:
+        raise Exception(f"wget failed: {result.stderr}")
+    print(f"✅ 已下載: {MODELING_FILE}")
+except Exception as e:
+    print(f"⚠️ wget 失敗，嘗試使用 urllib: {e}")
+    import urllib.request
+    urllib.request.urlretrieve(download_url, MODELING_FILE)
+    print(f"✅ 已下載: {MODELING_FILE}")
 
+# 將下載目錄加入 Python path
+if "/content" not in sys.path:
+    sys.path.insert(0, "/content")
 
-print("✅ Part 1 載入完成：環境設定與模型定義")
+# Import 原始模型
+from modeling_finetune import (
+    vit_base_dim512_local_global_attn_depth16_region_size2510_patch16_160
+)
+
+print("✅ MAE-DFER 模型定義載入成功！")
 # ============================================
 # MAE-DFER Valence Regression Fine-tuning
 # Part 2: Dataset 與 DataLoader
@@ -743,16 +406,19 @@ class MAEDFERValenceDataset(Dataset):
         # Horizontal flip
         if np.random.random() < 0.5:
             frames = np.flip(frames, axis=2).copy()
+
+        # 暫時先關閉 brightness 和 contrast 的 augmentation
         # Brightness
-        if np.random.random() < 0.3:
-            factor = np.random.uniform(0.8, 1.2)
-            frames = np.clip(frames.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+        # if np.random.random() < 0.3:
+        #     factor = np.random.uniform(0.8, 1.2)
+        #     frames = np.clip(frames.astype(np.float32) * factor, 0, 255).astype(np.uint8)
         # Contrast
-        if np.random.random() < 0.3:
-            factor = np.random.uniform(0.8, 1.2)
-            frames = frames.astype(np.float32)
-            mean_val = frames.mean()
-            frames = np.clip((frames - mean_val) * factor + mean_val, 0, 255).astype(np.uint8)
+        # if np.random.random() < 0.3:
+        #     factor = np.random.uniform(0.8, 1.2)
+        #     frames = frames.astype(np.float32)
+        #     mean_val = frames.mean()
+        #     frames = np.clip((frames - mean_val) * factor + mean_val, 0, 255).astype(np.uint8)
+        
         return frames
 
     def _normalize(self, frames: np.ndarray) -> torch.Tensor:
@@ -886,10 +552,40 @@ if os.path.exists(PRETRAINED_PATH):
     else:
         state_dict = checkpoint
     
+    # 移除 head 相關權重（我們用自己的 regression head）
     state_dict = {k: v for k, v in state_dict.items() if not k.startswith('head.')}
+    
+    # 載入權重並詳細檢查
     missing_keys, unexpected_keys = backbone.load_state_dict(state_dict, strict=False)
-    print(f"  Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
-    print("✅ 預訓練權重載入成功！")
+    
+    print(f"\n📊 權重載入檢查:")
+    print(f"  Missing keys: {len(missing_keys)}")
+    print(f"  Unexpected keys: {len(unexpected_keys)}")
+    
+    if missing_keys:
+        print(f"\n  ⚠️ Missing keys (前10個):")
+        for k in missing_keys[:10]:
+            print(f"     - {k}")
+        if len(missing_keys) > 10:
+            print(f"     ... 還有 {len(missing_keys) - 10} 個")
+    
+    if unexpected_keys:
+        print(f"\n  ⚠️ Unexpected keys (前10個):")
+        for k in unexpected_keys[:10]:
+            print(f"     - {k}")
+        if len(unexpected_keys) > 10:
+            print(f"     ... 還有 {len(unexpected_keys) - 10} 個")
+    
+    # 計算載入成功率
+    total_params = len(list(backbone.state_dict().keys()))
+    loaded_params = total_params - len(missing_keys)
+    load_rate = loaded_params / total_params * 100
+    print(f"\n  ✅ 權重載入成功率: {load_rate:.1f}% ({loaded_params}/{total_params})")
+    
+    if load_rate < 90:
+        print("  ⚠️ 警告：載入率低於 90%，預訓練效果可能受影響！")
+    else:
+        print("  ✅ 預訓練權重載入成功！")
 else:
     print(f"⚠️ 找不到預訓練權重，使用隨機初始化")
 
